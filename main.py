@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ import pandas as pd
 import plotly.express as px
 from plotly.utils import PlotlyJSONEncoder
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from clinic_nl2sql import normalize_question, translate_question
@@ -45,7 +46,7 @@ class ChatResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: str
+    status: str 
     database: str
     agent_memory_items: int
     vanna_agent_configured: bool
@@ -117,10 +118,13 @@ rate_limiter = SimpleRateLimiter()
 response_cache: dict[str, ChatResponse] = {}
 
 app = FastAPI(title="Clinic NL2SQL API", version="1.0.0")
+vanna_chat_handler = None
 
 if agent is not None:
+    from vanna.servers.base import ChatHandler, ChatRequest as VannaChatRequest
     from vanna.servers.fastapi import VannaFastAPIServer
 
+    vanna_chat_handler = ChatHandler(agent)
     app.mount("/vanna", VannaFastAPIServer(agent).create_app())
 
 
@@ -203,6 +207,63 @@ async def health() -> HealthResponse:
         vanna_agent_configured=bool(agent),
         llm_provider=agent_metadata["provider"],
     )
+
+
+if agent is not None and vanna_chat_handler is not None:
+    @app.post("/api/vanna/v2/chat_sse")
+    async def vanna_chat_sse(chat_request: VannaChatRequest, http_request: Request) -> StreamingResponse:
+        chat_request.request_context = chat_request.request_context.model_copy(
+            update={
+                "cookies": dict(http_request.cookies),
+                "headers": dict(http_request.headers),
+                "remote_addr": http_request.client.host if http_request.client else None,
+                "query_params": dict(http_request.query_params),
+                "metadata": chat_request.metadata,
+            }
+        )
+
+        async def generate():
+            try:
+                async for chunk in vanna_chat_handler.handle_stream(chat_request):
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                traceback.print_exc()
+                error_data = {
+                    "type": "error",
+                    "data": {"message": str(exc)},
+                    "conversation_id": chat_request.conversation_id or "",
+                    "request_id": chat_request.request_id or "",
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+
+    @app.post("/api/vanna/v2/chat_poll")
+    async def vanna_chat_poll(chat_request: VannaChatRequest, http_request: Request):
+        chat_request.request_context = chat_request.request_context.model_copy(
+            update={
+                "cookies": dict(http_request.cookies),
+                "headers": dict(http_request.headers),
+                "remote_addr": http_request.client.host if http_request.client else None,
+                "query_params": dict(http_request.query_params),
+                "metadata": chat_request.metadata,
+            }
+        )
+        try:
+            return await vanna_chat_handler.handle_poll(chat_request)
+        except Exception as exc:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Chat failed: {exc}") from exc
 
 
 @app.post("/chat", response_model=ChatResponse)
